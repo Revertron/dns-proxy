@@ -1,11 +1,13 @@
 [package]
 name = "dns-proxy"
 version = "0.1.0"
-authors = ["Revertron <rev@revertron.com>"]
+authors = ["Revertron <dns-proxy@revertron.com>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "A minimal DNS-proxy to stream DNS-queries and responses to multiple upstreams"
+keywords = ["DNS", "proxy", "mio", "UDP", "TCP"]
 
 [dependencies]
 mio = { version = "0.7", features = ["os-poll", "net"] }
 trust-dns-proto = "0.20.2"
+byteorder = "1.4"
+rand = "0.8"
