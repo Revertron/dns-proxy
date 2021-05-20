@@ -4,7 +4,7 @@ use mio::{Events, Poll, Interest, Token, Registry};
 use std::time::{Duration, Instant};
 use trust_dns_proto::op::Message;
 use trust_dns_proto::serialize::binary::BinEncodable;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use rand::prelude::IteratorRandom;
 use mio::event::Event;
 use std::io::{Read, Write, ErrorKind};
@@ -32,7 +32,10 @@ pub struct DnsProxy {
     bucket_udp: HashMap<u16, (SocketAddr, u16)>,
     bucket_tcp: HashMap<u16, (Token, u16)>,
     tcp_peers: HashMap<Token, TcpStream>,
+    tcp_forward_sockets: HashMap<Token, TcpStream>,
+    tcp_requests: VecDeque<Message>,
     responses: HashMap<Token, Vec<Message>>,
+    token: Token,
     id: u16
 }
 
@@ -45,7 +48,10 @@ impl DnsProxy {
             bucket_udp: HashMap::new(),
             bucket_tcp: HashMap::new(),
             tcp_peers: HashMap::new(),
+            tcp_forward_sockets: HashMap::new(),
+            tcp_requests: VecDeque::new(),
             responses: HashMap::new(),
+            token: Token(5),
             id: 1
         }
     }
@@ -54,8 +60,6 @@ impl DnsProxy {
         let mut buffer = [0u8; 2048];
         let mut poll = Poll::new().expect("Unable to create poll");
         let mut events = Events::with_capacity(16);
-        // Unique token for each incoming connection.
-        let mut unique_token = Token(FORWARD_UDP6.0 + 1);
 
         // Listening UDP socket
         let addr = self.listen.parse().expect(ADDR_PARSE_ERROR);
@@ -114,7 +118,7 @@ impl DnsProxy {
                         let connection = server_tcp.accept();
                         match connection {
                             Ok((mut stream, address)) => {
-                                let token = next(&mut unique_token);
+                                let token = self.next_token();
                                 debug!("Connected new client {} from {}", &token.0, &address);
                                 poll.registry().register(&mut stream, token, Interest::READABLE).expect(POLL_ERROR);
                                 self.tcp_peers.insert(token, stream);
@@ -146,14 +150,25 @@ impl DnsProxy {
                         poll.registry().reregister(&mut forward_udp6, FORWARD_UDP6, Interest::READABLE).expect(POLL_ERROR);
                     }
                     token => {
-                        let server = self.forwarders.iter().choose(&mut rand::thread_rng()).unwrap().clone();
-                        let socket = Self::select_socket(&server, &mut forward_udp4, &mut forward_udp6);
-                        if self.process_tcp_event(&event, &token, socket, server, poll.registry(), &mut buffer).is_err() {
-                            if let Some(stream) = self.tcp_peers.get_mut(&token) {
-                                let _ = poll.registry().deregister(stream);
-                                let _ = stream.shutdown(Shutdown::Both);
+                        if self.tcp_peers.contains_key(&token) {
+                            //debug!("Event from TCP client: {:?}", &event);
+                            let server = self.forwarders.iter().choose(&mut rand::thread_rng()).unwrap().clone();
+                            if self.process_client_tcp_event(&event, &token, server, poll.registry(), &mut buffer).is_err() {
+                                if let Some(stream) = self.tcp_peers.get_mut(&token) {
+                                    let _ = poll.registry().deregister(stream);
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                }
+                                self.tcp_peers.remove(&token);
                             }
-                            self.tcp_peers.remove(&token);
+                        } else if self.tcp_forward_sockets.contains_key(&token) {
+                            //debug!("Event from TCP upstream: {:?}", &event);
+                            if self.process_upstream_tcp_event(&event, &token, poll.registry(), &mut buffer).is_err() {
+                                if let Some(stream) = self.tcp_peers.get_mut(&token) {
+                                    let _ = poll.registry().deregister(stream);
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                }
+                                self.tcp_peers.remove(&token);
+                            }
                         }
                     }
                 }
@@ -161,7 +176,8 @@ impl DnsProxy {
         }
     }
 
-    fn process_tcp_event(&mut self, event: &Event, token: &Token, socket: &mut UdpSocket, server: SocketAddr, registry: &Registry, buffer: &mut [u8]) -> io::Result<()> {
+    /// Processes TCP events from our dear clients
+    fn process_client_tcp_event(&mut self, event: &Event, token: &Token, server: SocketAddr, registry: &Registry, buffer: &mut [u8]) -> io::Result<()> {
         let stream = match self.tcp_peers.get_mut(token) {
             Some(stream) => { stream }
             None => { return Err(io::Error::from(ErrorKind::NotFound)); }
@@ -179,8 +195,8 @@ impl DnsProxy {
             match read_message(stream, buffer) {
                 Ok(_size) => {
                     if let Ok(message) = Message::from_vec(&buffer) {
-                        //println!("Sending request to {}", &server);
-                        self.process_request_from_tcp(socket, server, message, token.clone(), registry);
+                        //debug!("Got request from client: {:?}, sending to {}", &message, &server);
+                        self.process_request_from_tcp(server, message, token.clone(), registry);
                     }
                 }
                 Err(_) => {
@@ -207,6 +223,56 @@ impl DnsProxy {
         Ok(())
     }
 
+    /// Processes TCP events from our dear clients
+    fn process_upstream_tcp_event(&mut self, event: &Event, token: &Token, registry: &Registry, buffer: &mut [u8]) -> io::Result<()> {
+        let stream = match self.tcp_forward_sockets.get_mut(token) {
+            Some(stream) => { stream }
+            None => { return Err(io::Error::from(ErrorKind::NotFound)); }
+        };
+
+        if event.is_error() || (event.is_read_closed() && event.is_write_closed()) {
+            // TODO close peer
+            return Err(io::Error::from(ErrorKind::BrokenPipe));
+        }
+
+        if event.is_readable() {
+            if event.is_read_closed() {
+                return Err(io::Error::from(ErrorKind::ConnectionAborted));
+            }
+            match read_message(stream, buffer) {
+                Ok(_size) => {
+                    if let Ok(message) = Message::from_vec(&buffer) {
+                        //debug!("Got response from TCP upstream: {:?}", &message);
+                        self.process_response_from_tcp(message, registry);
+                    }
+                }
+                Err(_) => {
+                    return Err(io::Error::from(ErrorKind::BrokenPipe));
+                }
+            }
+        }
+        if event.is_writable() {
+            match self.tcp_forward_sockets.get_mut(token) {
+                None => { return Err(io::Error::from(ErrorKind::NotFound)); }
+                Some(stream) => {
+                    if let Some(message) = self.tcp_requests.pop_front() {
+                        let buf = message.to_vec().unwrap();
+                        stream.write_u16::<BigEndian>(buf.len() as u16)?;
+                        stream.write_all(&buf)?;
+                        if !self.tcp_requests.is_empty() {
+                            registry.reregister(stream, token.clone(), Interest::READABLE | Interest::WRITABLE)?;
+                        } else {
+                            registry.reregister(stream, token.clone(), Interest::READABLE)?;
+                        }
+                    } else {
+                        registry.reregister(stream, token.clone(), Interest::READABLE)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn process_upstream_response(&mut self, socket: &mut UdpSocket, mut server_udp: &mut UdpSocket, registry: &Registry, buffer: &mut [u8]) -> bool {
         let (_size, _addr) = match socket.recv_from(buffer) {
             Ok(pair) => pair,
@@ -222,7 +288,7 @@ impl DnsProxy {
         };
         // TODO check addr to be equal to forwarding address
         if let Ok(message) = Message::from_vec(&buffer) {
-            info!("Response: {:?}", &message);
+            //trace!("Response: {:?}", &message);
             self.process_response(&mut server_udp, registry, message);
         }
         true
@@ -239,14 +305,33 @@ impl DnsProxy {
         }
     }
 
-    fn process_request_from_tcp(&mut self, socket: &mut UdpSocket, forward: SocketAddr, mut message: Message, source: Token, registry: &Registry) {
+    fn process_request_from_tcp(&mut self, forward: SocketAddr, mut message: Message, source_token: Token, registry: &Registry) {
         let id = self.next_id();
         let request_id = message.id();
         message.set_id(id);
-        let token= if socket.local_addr().unwrap().is_ipv6() { FORWARD_UDP6 } else { FORWARD_UDP4 };
-        if socket.send_to(message.to_bytes().unwrap().as_slice(), forward).is_ok() {
-            registry.reregister(socket, token, Interest::READABLE).expect("Error registering poll");
-            self.bucket_tcp.insert(id, (source, request_id));
+        self.tcp_requests.push_back(message);
+        if let Ok(mut socket) = TcpStream::connect(forward) {
+            debug!("Connected to {}", &forward);
+            let token = self.next_token();
+            registry.register(&mut socket, token, Interest::WRITABLE).expect("Error registering poll");
+            self.bucket_tcp.insert(id, (source_token, request_id));
+            self.tcp_forward_sockets.insert(token, socket);
+        }
+    }
+
+    fn process_response_from_tcp(&mut self, mut message: Message, registry: &Registry) {
+        if let Some((token, id)) = self.bucket_tcp.get(&message.id()) {
+            // If we still have that connection
+            if let Some(stream) = self.tcp_peers.get_mut(&token) {
+                message.set_id(*id);
+                self.responses.entry(token.to_owned()).or_default().push(message);
+                if registry.reregister(stream, token.clone(), Interest::WRITABLE).is_err() {
+                    let _ = registry.deregister(stream);
+                    let _ = stream.shutdown(Shutdown::Both);
+                    self.tcp_peers.remove(token);
+                    self.responses.remove(token);
+                }
+            }
         }
     }
 
@@ -283,17 +368,17 @@ impl DnsProxy {
         self.id = self.id.wrapping_add(1);
         next
     }
+
+    /// Gets new token from old token, mutating the last
+    pub fn next_token(&mut self) -> Token {
+        let current = self.token.0;
+        self.token.0 += 1;
+        Token(current)
+    }
 }
 
 fn generate_port() -> u16 {
     (rand::random::<u16>() % 55000) + 2000
-}
-
-/// Gets new token from old token, mutating the last
-pub fn next(current: &mut Token) -> Token {
-    let next = current.0;
-    current.0 += 1;
-    Token(next)
 }
 
 fn read_message(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<usize, usize> {
