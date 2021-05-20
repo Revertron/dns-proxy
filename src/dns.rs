@@ -11,6 +11,9 @@ use std::io::{Read, Write, ErrorKind};
 use std::{thread, io};
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 
+#[allow(unused_imports)]
+use log::{debug, error, info, trace, warn, LevelFilter};
+
 const SERVER_UDP: Token = Token(0);
 const SERVER_TCP: Token = Token(1);
 const FORWARD_UDP4: Token = Token(2);
@@ -92,7 +95,7 @@ impl DnsProxy {
                                             break;
                                         }
                                     }
-                                    println!("Failed to read from UDP socket: {:?}", err);
+                                    debug!("Failed to read from UDP socket: {:?}", err);
                                     poll.registry().reregister(&mut server_udp, SERVER_UDP, Interest::READABLE).expect(POLL_ERROR);
                                     continue;
                                 }
@@ -100,7 +103,7 @@ impl DnsProxy {
                             if let Ok(message) = Message::from_vec(&buffer) {
                                 let server = self.forwarders.iter().choose(&mut rand::thread_rng()).unwrap().clone();
                                 let mut socket = Self::select_socket(&server, &mut forward_udp4, &mut forward_udp6);
-                                println!("Sending request to {}", &server);
+                                debug!("Sending request to {}", &server);
                                 self.process_request_from_udp(&mut socket, server, message, addr, poll.registry());
                             }
                         }
@@ -112,7 +115,7 @@ impl DnsProxy {
                         match connection {
                             Ok((mut stream, address)) => {
                                 let token = next(&mut unique_token);
-                                println!("Connected new client {} from {}", &token.0, &address);
+                                debug!("Connected new client {} from {}", &token.0, &address);
                                 poll.registry().register(&mut stream, token, Interest::READABLE).expect(POLL_ERROR);
                                 self.tcp_peers.insert(token, stream);
                             }
@@ -123,22 +126,22 @@ impl DnsProxy {
                     FORWARD_UDP4 => {
                         if event.is_readable() {
                             if !self.process_upstream_response(&mut forward_udp4, &mut server_udp, poll.registry(), &mut buffer) {
-                                println!("{}", LOOP_FINISHED);
+                                warn!("{}", LOOP_FINISHED);
                                 break;
                             }
                         } else {
-                            println!("Event: {:?}", &event);
+                            warn!("Event: {:?}", &event);
                         }
                         poll.registry().reregister(&mut forward_udp4, FORWARD_UDP4, Interest::READABLE).expect(POLL_ERROR);
                     }
                     FORWARD_UDP6 => {
                         if event.is_readable() {
                             if !self.process_upstream_response(&mut forward_udp6, &mut server_udp, poll.registry(), &mut buffer) {
-                                println!("{}", LOOP_FINISHED);
+                                warn!("{}", LOOP_FINISHED);
                                 break;
                             }
                         } else {
-                            println!("Event: {:?}", &event);
+                            warn!("Event: {:?}", &event);
                         }
                         poll.registry().reregister(&mut forward_udp6, FORWARD_UDP6, Interest::READABLE).expect(POLL_ERROR);
                     }
@@ -213,12 +216,13 @@ impl DnsProxy {
                         return false;
                     }
                 }
-                println!("Failed to read from UDP socket: {:?}", err);
+                warn!("Failed to read from UDP socket: {:?}", err);
                 return true;
             }
         };
         // TODO check addr to be equal to forwarding address
         if let Ok(message) = Message::from_vec(&buffer) {
+            info!("Response: {:?}", &message);
             self.process_response(&mut server_udp, registry, message);
         }
         true

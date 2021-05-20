@@ -11,3 +11,5 @@ mio = { version = "0.7", features = ["os-poll", "net"] }
 trust-dns-proto = "0.20.2"
 byteorder = "1.4"
 rand = "0.8"
+log = "0.4.14"
+simplelog = "0.10.0"
