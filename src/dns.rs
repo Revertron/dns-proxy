@@ -28,6 +28,7 @@ pub struct DnsProxy {
     forwarders: Vec<SocketAddr>,
     bucket_udp: HashMap<u16, (SocketAddr, u16)>,
     bucket_tcp: HashMap<u16, (Token, u16)>,
+    tcp_peers: HashMap<Token, TcpStream>,
     responses: HashMap<Token, Vec<Message>>,
     id: u16
 }
@@ -35,7 +36,15 @@ pub struct DnsProxy {
 impl DnsProxy {
     pub fn new(listen: &str, servers: &[String]) -> Self {
         let forwarders: Vec<SocketAddr> = servers.iter().map(|addr| addr.parse().unwrap()).collect();
-        DnsProxy { listen: listen.to_owned(), forwarders, bucket_udp: HashMap::new(), bucket_tcp: HashMap::new(), responses: HashMap::new(), id: 1 }
+        DnsProxy {
+            listen: listen.to_owned(),
+            forwarders,
+            bucket_udp: HashMap::new(),
+            bucket_tcp: HashMap::new(),
+            tcp_peers: HashMap::new(),
+            responses: HashMap::new(),
+            id: 1
+        }
     }
 
     pub fn run_server(&mut self) {
@@ -44,7 +53,6 @@ impl DnsProxy {
         let mut events = Events::with_capacity(16);
         // Unique token for each incoming connection.
         let mut unique_token = Token(FORWARD_UDP6.0 + 1);
-        let mut tcp_peers: HashMap<Token, TcpStream> = HashMap::new();
 
         // Listening UDP socket
         let addr = self.listen.parse().expect(ADDR_PARSE_ERROR);
@@ -106,7 +114,7 @@ impl DnsProxy {
                                 let token = next(&mut unique_token);
                                 println!("Connected new client {} from {}", &token.0, &address);
                                 poll.registry().register(&mut stream, token, Interest::READABLE).expect(POLL_ERROR);
-                                tcp_peers.insert(token, stream);
+                                self.tcp_peers.insert(token, stream);
                             }
                             Err(_) => {}
                         }
@@ -114,7 +122,7 @@ impl DnsProxy {
                     }
                     FORWARD_UDP4 => {
                         if event.is_readable() {
-                            if !self.process_upstream_response(&mut forward_udp4, &mut server_udp, &mut tcp_peers, poll.registry(), &mut buffer) {
+                            if !self.process_upstream_response(&mut forward_udp4, &mut server_udp, poll.registry(), &mut buffer) {
                                 println!("{}", LOOP_FINISHED);
                                 break;
                             }
@@ -125,7 +133,7 @@ impl DnsProxy {
                     }
                     FORWARD_UDP6 => {
                         if event.is_readable() {
-                            if !self.process_upstream_response(&mut forward_udp6, &mut server_udp, &mut tcp_peers, poll.registry(), &mut buffer) {
+                            if !self.process_upstream_response(&mut forward_udp6, &mut server_udp, poll.registry(), &mut buffer) {
                                 println!("{}", LOOP_FINISHED);
                                 break;
                             }
@@ -137,12 +145,12 @@ impl DnsProxy {
                     token => {
                         let server = self.forwarders.iter().choose(&mut rand::thread_rng()).unwrap().clone();
                         let socket = Self::select_socket(&server, &mut forward_udp4, &mut forward_udp6);
-                        if self.process_tcp_event(&mut tcp_peers, &event, &token, socket, server, poll.registry(), &mut buffer).is_err() {
-                            if let Some(stream) = tcp_peers.get_mut(&token) {
+                        if self.process_tcp_event(&event, &token, socket, server, poll.registry(), &mut buffer).is_err() {
+                            if let Some(stream) = self.tcp_peers.get_mut(&token) {
                                 let _ = poll.registry().deregister(stream);
                                 let _ = stream.shutdown(Shutdown::Both);
                             }
-                            tcp_peers.remove(&token);
+                            self.tcp_peers.remove(&token);
                         }
                     }
                 }
@@ -150,8 +158,8 @@ impl DnsProxy {
         }
     }
 
-    fn process_tcp_event(&mut self, peers: &mut HashMap<Token, TcpStream>, event: &Event, token: &Token, socket: &mut UdpSocket, server: SocketAddr, registry: &Registry, buffer: &mut [u8]) -> io::Result<()> {
-        let stream = match peers.get_mut(token) {
+    fn process_tcp_event(&mut self, event: &Event, token: &Token, socket: &mut UdpSocket, server: SocketAddr, registry: &Registry, buffer: &mut [u8]) -> io::Result<()> {
+        let stream = match self.tcp_peers.get_mut(token) {
             Some(stream) => { stream }
             None => { return Err(io::Error::from(ErrorKind::NotFound)); }
         };
@@ -178,7 +186,7 @@ impl DnsProxy {
             }
         }
         if event.is_writable() {
-            match peers.get_mut(token) {
+            match self.tcp_peers.get_mut(token) {
                 None => { return Err(io::Error::from(ErrorKind::NotFound)); }
                 Some(stream) => {
                     if let Some(responses) = self.responses.remove(&token) {
@@ -196,7 +204,7 @@ impl DnsProxy {
         Ok(())
     }
 
-    fn process_upstream_response(&mut self, socket: &mut UdpSocket, mut server_udp: &mut UdpSocket, peers: &mut HashMap<Token, TcpStream>, registry: &Registry, buffer: &mut [u8]) -> bool {
+    fn process_upstream_response(&mut self, socket: &mut UdpSocket, mut server_udp: &mut UdpSocket, registry: &Registry, buffer: &mut [u8]) -> bool {
         let (_size, _addr) = match socket.recv_from(buffer) {
             Ok(pair) => pair,
             Err(err) => {
@@ -211,7 +219,7 @@ impl DnsProxy {
         };
         // TODO check addr to be equal to forwarding address
         if let Ok(message) = Message::from_vec(&buffer) {
-            self.process_response(&mut server_udp, peers, registry, message);
+            self.process_response(&mut server_udp, registry, message);
         }
         true
     }
@@ -238,7 +246,7 @@ impl DnsProxy {
         }
     }
 
-    fn process_response(&mut self, socket: &mut UdpSocket, peers: &mut HashMap<Token, TcpStream>, registry: &Registry, mut message: Message) {
+    fn process_response(&mut self, socket: &mut UdpSocket, registry: &Registry, mut message: Message) {
         if let Some((addr, id)) = self.bucket_udp.get(&message.id()) {
             message.set_id(*id);
             socket.send_to(message.to_bytes().unwrap().as_slice(), *addr).expect("Error sending response to client!");
@@ -246,13 +254,13 @@ impl DnsProxy {
         }
         if let Some((token, id)) = self.bucket_tcp.get(&message.id()) {
             // If we still have that connection
-            if let Some(stream) = peers.get_mut(&token) {
+            if let Some(stream) = self.tcp_peers.get_mut(&token) {
                 message.set_id(*id);
                 self.responses.entry(token.to_owned()).or_default().push(message);
                 if registry.reregister(stream, token.clone(), Interest::WRITABLE).is_err() {
                     let _ = registry.deregister(stream);
                     let _ = stream.shutdown(Shutdown::Both);
-                    peers.remove(token);
+                    self.tcp_peers.remove(token);
                 }
             }
         }
